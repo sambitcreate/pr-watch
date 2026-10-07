@@ -14,8 +14,8 @@ in-turn poll. The shell daemon remains the watcher; pi stays the fixer.
 ## Headless wake (optional `--agent` mode)
 
 ```sh
-AGENT_CMD='pi --print'
+AGENT_CMD='pi -p "$PRWATCH_BRIEF"'
 ```
 
-`pi -p/--print` runs one non-interactive turn per wake with the brief on
-stdin.
+`pi -p/--print` runs one non-interactive turn per wake. The brief is passed
+as the prompt argument via `$PRWATCH_BRIEF` (it is also on stdin).
