@@ -36,9 +36,12 @@ pr-watchd add <owner/repo> <pr-number> --auto     # auto-merge + watch for confl
 pr-watchd add <owner/repo> <pr-number> --agent    # also hand failures to a headless agent
 ```
 
+`--agent` needs a checkout to work in: run it from inside the repo, or pass
+`--dir <path>`.
+
 The daemon polls GitHub on a timer, outside any LLM. It wakes you (or the
 user) only on: newly-failed checks, merge conflicts, green-and-ready, or new
-*human* comments (its own replies and bot comments never wake it).
+*human* comments and reviews (its own replies and bot comments never wake it).
 
 Verify with `pr-watchd list`. Then **end your turn**. The watcher continues
 without you; you will be invoked fresh, with a minimal brief, when there is
@@ -67,7 +70,7 @@ Rules they violate: no unbounded loops (always cap iterations and wall time),
 no tool call may block longer than ~5 seconds, no re-polling state you can be
 woken for.
 
-## If you absolutely cannot use the daemon (no shell access)
+## If you cannot use the daemon (not installed, and you can't install it)
 
 Fall back to the *cheap* loop, and say why you're falling back:
 
