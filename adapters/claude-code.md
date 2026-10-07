@@ -15,9 +15,11 @@ whenever a PR-watch request matches the description.
 In `pr-watchd` config (`~/.config/pr-watch/config.env`):
 
 ```sh
-AGENT_CMD='claude -p --allowedTools "Bash(gh:*) Read Edit" --permission-mode acceptEdits'
+AGENT_CMD='claude -p --allowedTools "Bash(gh:*) Bash(git:*) Read Edit" --permission-mode acceptEdits'
 ```
 
-Each wake pipes a minimal brief (repo, PR, failing checks, rules) to
-`claude -p` as a fresh one-shot session — never your interactive context.
+Each wake pipes a minimal brief (repo, PR, failing checks, rules) on stdin to
+`claude -p` as a fresh one-shot session, in the background, inside the
+watch's checkout (`pr-watchd add ... --agent [--dir <path>]`) — never your
+interactive context. Drop `Bash(git:*)` if you want diagnosis only, no pushes.
 Without `AGENT_CMD` the daemon only sends OS notifications.
