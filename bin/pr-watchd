@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# pr-watchd — PR babysitting that never burns tokens while waiting.
+#
+# A plain shell daemon: polls GitHub on a timer, diffs watch state, and only
+# wakes a human (notification) or an agent (headless one-shot) when something
+# actually changes. Polls and waits happen OUTSIDE any LLM context.
+#
+# Subcommands:
+#   pr-watchd add <owner/repo> <pr#> [--auto [--squash|--merge|--rebase]] [--agent]
+#   pr-watchd remove <owner/repo> <pr#>
+#   pr-watchd list
+#   pr-watchd tick              # one poll pass; call from launchd/cron every few minutes
+#   pr-watchd digest [owner/repo]  # zero-token "what's mergeable" table
+#
+# Design guards (see README):
+#   WAKE_LIMIT          max unproductive wakes before a watch is parked (default 10)
+#   READ_FAILURE_LIMIT  consecutive read errors before a watch is dropped (default 15)
+#   own-reply suppression, bot suppression, head-move reset — baked in.
+
+set -u
+
+PRWATCH_HOME="${PRWATCH_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-watch}"
+PRWATCH_BIN="${PRWATCH_BIN:-$HOME/.local/bin}"
+POLL_INTERVAL="${POLL_INTERVAL:-300}"
+WAKE_LIMIT="${WAKE_LIMIT:-10}"
+READ_FAILURE_LIMIT="${READ_FAILURE_LIMIT:-15}"
+NOTIFY_CMD="${NOTIFY_CMD:-}"
+AGENT_CMD="${AGENT_CMD:-}"
+GH="${GH:-gh}"
+
+mkdir -p "$PRWATCH_HOME" 2>/dev/null
+
+account() { "$GH" api user --jq .login 2>/dev/null || echo "unknown-account"; }
+
+notify() { # notify <title> <message>
+  local title="$1" msg="$2"
+  if [ -n "$NOTIFY_CMD" ]; then
+    "$NOTIFY_CMD" "$title" "$msg" 2>/dev/null || true
+  elif command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$msg\" with title \"pr-watchd\" subtitle \"$title\"" >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "pr-watchd: $title" "$msg" 2>/dev/null || true
+  else
+    printf '[pr-watchd] %s: %s\n' "$title" "$msg"
+  fi
+}
+
+state_file() { # state_file <owner/repo> <pr#>
+  printf '%s/%s__%s.state' "$PRWATCH_HOME" "$(printf '%s' "$1" | tr '/' '__')" "$2"
+}
+
+agent_log() { printf '%s/agent-%s__%s.log' "$PRWATCH_HOME" "$(printf '%s' "$1" | tr '/' '__')" "$2"; }
+
+# ---- read current PR facts in one gh call (TSV: sha, mergeable, mergeState,
+# ---- failed-checks csv, new-human-comment count) ------------------------------
+PR_JQ='
+  def human_new:
+    [ (.comments // [])[]
+      | select(((.databaseId // 0) > (if $lastcid == "" then 0 else ($lastcid | tonumber) end)))
+      | select((.author.login | test("\\[bot\\]$") | not) and (.author.login != $me)) ];
+  (human_new | length) as $nh |
+  ([ (.statusCheckRollup // [])[]
+     | select(
+         ((.__typename // "") == "CheckRun" and
+           ((.conclusion // "") == "FAILURE" or (.conclusion // "") == "CANCELLED" or (.conclusion // "") == "ACTION_REQUIRED"))
+         or
+         ((.__typename // "") == "StatusContext" and
+           ((.state // "") == "FAILURE" or (.state // "") == "ERROR"))
+       )
+     | (if ((.__typename // "") == "CheckRun") then (.name // "?") else (.context // "?") end) ]
+    | unique | join(",")) as $failed |
+  "\(.headRefOid // "")\t\(.mergeable // "")\t\(.mergeStateStatus // "")\t\($failed)\t\($nh)"
+'
+
+fetch_pr() { # fetch_pr <repo> <pr> <lastcid> <me>  -> "sha<TAB>mergeable<TAB>state<TAB>failed<TAB>newhumans"
+  "$GH" pr view "$2" --repo "$1" --json \
+    headRefOid,mergeable,mergeStateStatus,statusCheckRollup,comments \
+    --arg lastcid "$3" --arg me "$4" --jq "$PR_JQ"
+}
+
+# ---- per-watch state (flat KEY=VALUE file) ----------------------------------
+st_get() { # st_get <file> <key>
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
+}
+st_set() { # st_set <file> <key> <value>  (literal value; no regex in replacement)
+  local f="$1" k="$2" v="$3" tmp="${f}.tmp.$$"
+  touch "$f" 2>/dev/null || return 1
+  grep -v "^$k=" "$f" > "$tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$k" "$v" >> "$tmp"
+  mv "$tmp" "$f"
+}
+
+# ---- agent handoff (headless, minimal brief) ---------------------------------
+run_agent() { # run_agent <repo> <pr> <brief>
+  [ -n "$AGENT_CMD" ] || return 0
+  local repo="$1" pr="$2" brief="$3"
+  {
+    printf 'PR watch wake — %s#%s\n\n%s\n' "$repo" "$pr" "$brief"
+    printf 'Rules: fix forward. Cap: 10 tool rounds. One retry max for flaky CI. '
+    printf 'Push to the PR head branch when done. Do not wait or poll; report and exit.\n'
+  } | ${AGENT_CMD} >> "$(agent_log "$repo" "$pr")" 2>&1 || true
+}
+
+# ---- one poll pass ------------------------------------------------------------
+process_watch() { # process_watch <owner/repo> <pr#>
+  local repo="$1" pr="$2" f me row
+  f="$(state_file "$repo" "$pr")"
+  [ -f "$f" ] || { echo "no state for $repo#$pr"; return 1; }
+
+  me="$(account)"
+  row="$(fetch_pr "$repo" "$pr" "$(st_get "$f" LAST_CID)" "$me")" || {
+    local fails; fails=$(( $(st_get "$f" READ_FAILS || echo 0) + 1 ))
+    st_set "$f" READ_FAILS "$fails"
+    if [ "$fails" -ge "$READ_FAILURE_LIMIT" ]; then
+      notify "watch dropped" "$repo#$pr unreadable $fails times in a row"
+      rm -f "$f"
+    fi
+    return 0
+  }
+  st_set "$f" READ_FAILS 0
+
+  local sha mergeable mstate failed nhumans
+  sha="$(printf '%s' "$row" | cut -f1)"
+  mergeable="$(printf '%s' "$row" | cut -f2)"
+  mstate="$(printf '%s' "$row" | cut -f3)"
+  failed="$(printf '%s' "$row" | cut -f4)"
+  nhumans="$(printf '%s' "$row" | cut -f5)"
+
+  # head moved (new push): reset wake counter and remembered failures
+  local prev_sha; prev_sha="$(st_get "$f" HEAD_SHA)"
+  if [ -n "$prev_sha" ] && [ "$sha" != "$prev_sha" ]; then
+    st_set "$f" WAKES 0
+    st_set "$f" FAILED ""
+    st_set "$f" REPORTED_CONFLICT 0
+    st_set "$f" REPORTED_GREEN 0
+  fi
+
+  local wakes; wakes=$(( $(st_get "$f" WAKES || echo 0) ))
+  local reported=""
+
+  # 1. newly-failed checks are reported the moment they appear
+  if [ -n "$failed" ]; then
+    local known new
+    known="$(st_get "$f" FAILED)"
+    new=""
+    IFS=',' read -r -a names <<< "$failed"
+    for n in "${names[@]}"; do
+      case ",$known," in *",$n,"*) ;; *) new="${new:+$new, }$n" ;; esac
+    done
+    if [ -n "$new" ]; then
+      reported="checks failing: $new"
+      st_set "$f" FAILED "$failed"
+      run_agent "$repo" "$pr" "Checks failing on $repo#$pr: $new. Fetch logs with: gh run list/gh pr checks. Fix and push."
+    fi
+  elif [ -n "$(st_get "$f" FAILED)" ]; then
+    st_set "$f" FAILED ""
+  fi
+
+  # 2. conflict (reported once per head)
+  if [ "$mstate" = "DIRTY" ] && [ "$(st_get "$f" REPORTED_CONFLICT)" != "1" ]; then
+    reported="${reported:+$reported; }merge conflict with base"
+    st_set "$f" REPORTED_CONFLICT 1
+  fi
+
+  # 3. green / ready
+  if [ "$mstate" = "CLEAN" ] && [ "$mergeable" = "MERGEABLE" ] && [ "$(st_get "$f" REPORTED_GREEN)" != "1" ]; then
+    reported="${reported:+$reported; }all checks green — ready to merge"
+    st_set "$f" REPORTED_GREEN 1
+  fi
+
+  # 4. new human comments (bots and own replies never wake it)
+  if [ "${nhumans:-0}" -gt 0 ] 2>/dev/null; then
+    reported="${reported:+$reported; }$nhumans new human comment(s)"
+  fi
+
+  # remember last comment id for the next pass
+  local lastcid
+  lastcid="$("$GH" pr view "$pr" --repo "$repo" --json comments --jq '([(.comments // [])[].databaseId] | max // 0) | tostring')" 2>/dev/null || lastcid=""
+  [ -n "$lastcid" ] && st_set "$f" LAST_CID "$lastcid"
+  st_set "$f" HEAD_SHA "$sha"
+
+  if [ -n "$reported" ]; then
+    wakes=$(( wakes + 1 ))
+    st_set "$f" WAKES "$wakes"
+    notify "$repo#$pr" "$reported"
+    if [ "$wakes" -ge "$WAKE_LIMIT" ]; then
+      notify "$repo#$pr" "parked: $wakes wakes without resolution — re-add with: pr-watchd add $repo $pr"
+      rm -f "$f"
+    fi
+  fi
+  [ "${PRWATCH_DEBUG:-0}" = "1" ] && echo "$repo#$pr sha=${sha:0:8} mstate=$mstate wakes=$wakes reported=[$reported]"
+}
+
+cmd_tick() {
+  local sf found=0
+  for sf in "$PRWATCH_HOME"/*.state; do
+    [ -f "$sf" ] || return 0
+    found=1
+    local name repo pr
+    name="$(basename "$sf" .state)"
+    repo="$(printf '%s' "$name" | sed -e 's/^\(.*\)__[0-9]*$/\1/' -e 's/__/\//')"
+    pr="${name##*__}"
+    process_watch "$repo" "$pr"
+  done
+  [ "$found" = "1" ] || echo "no watches registered"
+}
+
+cmd_add() { # cmd_add <owner/repo> <pr#> [--auto [--squash|--merge|--rebase]] [--agent]
+  local repo="$1" pr="$2"; shift 2
+  local do_auto=0 method="--squash" want_agent=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --auto) do_auto=1 ;;
+      --squash|--merge|--rebase) method="$1" ;;
+      --agent) want_agent=1 ;;
+      *) echo "unknown flag: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+  local f; f="$(state_file "$repo" "$pr")"
+  : > "$f"
+  st_set "$f" READ_FAILS 0
+  st_set "$f" WAKES 0
+  st_set "$f" REPORTED_CONFLICT 0
+  st_set "$f" REPORTED_GREEN 0
+  st_set "$f" AGENT "$want_agent"
+  local me; me="$(account)"
+  local row; row="$(fetch_pr "$repo" "$pr" "" "$me")" || { echo "cannot read $repo#$pr" >&2; rm -f "$f"; return 1; }
+  st_set "$f" HEAD_SHA "$(printf '%s' "$row" | cut -f1)"
+  # seed baseline: only CHANGES from here on wake anyone
+  st_set "$f" FAILED "$(printf '%s' "$row" | cut -f4)"
+  local m0; m0="$(printf '%s' "$row" | cut -f3)"
+  if [ "$m0" = "CLEAN" ] && [ "$(printf '%s' "$row" | cut -f2)" = "MERGEABLE" ]; then st_set "$f" REPORTED_GREEN 1; fi
+  if [ "$m0" = "DIRTY" ]; then st_set "$f" REPORTED_CONFLICT 1; fi
+  local lastcid
+  lastcid="$("$GH" pr view "$pr" --repo "$repo" --json comments --jq '([(.comments // [])[].databaseId] | max // 0) | tostring')" 2>/dev/null || lastcid="0"
+  st_set "$f" LAST_CID "$lastcid"
+
+  if [ "$do_auto" = "1" ]; then
+    echo "  → setting auto-merge: $GH pr merge $pr --repo $repo --auto $method"
+    "$GH" pr merge "$pr" --repo "$repo" --auto "$method" && echo "  → GitHub will merge when green. Watcher will only ping on conflict/failure." || return 1
+  fi
+  echo "watching $repo#$pr  (wake limit $WAKE_LIMIT, poll ~${POLL_INTERVAL}s)"
+  echo "  state: $f"
+}
+
+cmd_remove() {
+  local f; f="$(state_file "$1" "$2")"
+  rm -f "$f" && echo "removed $1#$2"
+}
+
+cmd_list() {
+  local sf name repo pr wakes mstate
+  printf '%-40s %-8s %-7s %s\n' "WATCH" "PR" "WAKES" "HEAD"
+  for sf in "$PRWATCH_HOME"/*.state; do
+    [ -f "$sf" ] || { echo "  (none)"; return 0; }
+    name="$(basename "$sf" .state)"
+    repo="$(printf '%s' "$name" | sed -e 's/^\(.*\)__[0-9]*$/\1/' -e 's/__/\/')"
+    pr="${name##*__}"
+    printf '%-40s %-8s %-7s %s\n' "$repo" "$pr" "$(st_get "$sf" WAKES)" "$(st_get "$sf" HEAD_SHA | cut -c1-8)"
+  done
+}
+
+cmd_digest() { # zero-token status table; optional <owner/repo>, defaults to current repo
+  local repo="${1:-}"
+  local args=(--state open --limit 40 --json number,title,mergeStateStatus,reviewDecision,isDraft)
+  if [ -n "$repo" ]; then args+=(--repo "$repo"); fi
+  "$GH" pr list "${args[@]}" --jq \
+    'sort_by(.mergeStateStatus) | .[] |
+     "\(.number)\t\(.mergeStateStatus)\t\(.reviewDecision // "-")\t\(.title)"' |
+  awk -F'\t' 'BEGIN{printf "%-6s %-10s %-9s %s\n","PR","STATE","REVIEWS","TITLE"}
+              {printf "%-6s %-10s %-9s %s\n",$1,$2,$3,substr($4,1,60)}'
+}
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+cmd="${1:-}"; [ -n "$cmd" ] || usage 0
+shift || true
+case "$cmd" in
+  add)    [ $# -ge 2 ] || usage 2; cmd_add "$@" ;;
+  remove) [ $# -ge 2 ] || usage 2; cmd_remove "$@" ;;
+  list)   cmd_list ;;
+  tick)   cmd_tick ;;
+  digest) cmd_digest "$@" ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "unknown command: $cmd" >&2; usage 2 ;;
+esac

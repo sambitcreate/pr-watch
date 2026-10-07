@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# fake gh — smoke-test stub. Drives pr-watchd from canned fixtures in $FAKE_DIR
+# while running the REAL jq diffing logic extracted from the daemon script.
+set -u
+FAKE_DIR="${FAKE_DIR:?set FAKE_DIR}"
+PRWATCHD_SRC="${PRWATCHD_SRC:?set PRWATCHD_SRC}"
+echo "$*" >> "$FAKE_DIR/calls.log"
+
+# Extract the daemon's canonical jq program once per invocation (cheap, correct).
+PRJQ="$(sed -n "/^PR_JQ='/,/^'$/p" "$PRWATCHD_SRC" | sed '1d;$d')"
+
+case "$1" in
+  api)
+    echo "${FAKE_ACCOUNT:-me}" ;;
+  pr)
+    case "$2" in
+      view)
+        if printf '%s\n' "$*" | grep -q 'headRefOid'; then
+          jq -r --arg lastcid "$(cat "$FAKE_DIR/lastcid.txt" 2>/dev/null || echo 0)" \
+                --arg me "${FAKE_ACCOUNT:-me}" "$PRJQ" "$FAKE_DIR/pr.json"
+        else
+          jq -r '([(.comments // [])[].databaseId] | max // 0) | tostring' "$FAKE_DIR/pr.json"
+        fi ;;
+      merge) echo "auto-merge enabled (fake)" ;;
+      list)  cat "$FAKE_DIR/list.tsv" 2>/dev/null ;;
+      *) echo "fake gh: unknown pr subcommand: $2" >&2; exit 1 ;;
+    esac ;;
+  *)
+    echo "fake gh: unhandled: $*" >&2; exit 1 ;;
+esac
