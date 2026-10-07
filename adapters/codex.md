@@ -14,9 +14,13 @@ Codex also honors `AGENTS.md` in repos it works in; the repo-level
 ## Headless wake (optional `--agent` mode)
 
 ```sh
-AGENT_CMD='codex exec --sandbox read-only -'
+# diagnose and report only (the agent cannot edit or push):
+AGENT_CMD='codex exec --sandbox read-only'
+# fix and push: writable checkout plus network for `git push`
+AGENT_CMD='codex exec --sandbox workspace-write -c sandbox_workspace_write.network_access=true'
 ```
 
-Codex `exec` accepts the brief on stdin as a fresh non-interactive turn.
-Keep the sandbox read-only by default; widen it deliberately if you want the
-woken agent to push fixes itself.
+With no prompt argument, `codex exec` reads the brief from stdin as a fresh
+non-interactive turn. The brief tells the agent to push only if its
+permissions allow, and to report a diagnosis otherwise — so read-only is a
+safe default; widen it deliberately.
