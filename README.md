@@ -10,14 +10,13 @@ Works with **Claude Code, Codex, Pi, and opencode**.
 
 ## Why
 
-An audit of local coding-agent logs found that when agents are asked to
-"watch CI" or "babysit a PR", nearly all of the wasted tokens come from one
-anti-pattern: **polling inside the agent turn**. Every `sleep 60` in a loop
-re-sends the entire conversation context to the model on the next
-iteration. Billions of input tokens have been spent — at API prices, real
-money — teaching agents to do what a `while` loop and `gh api` do for free.
+When agents are asked to "watch CI" or "babysit a PR", most of the wasted
+tokens come from one anti-pattern: **polling inside the agent turn**. Every
+`sleep 60` in a loop re-sends the entire conversation context to the model on
+the next iteration — paying model prices for what a `while` loop and `gh api`
+do for free.
 
-Worse, the hand-rolled loops are reliably buggy in the same few ways:
+Worse, the hand-rolled loops tend to break in the same few ways:
 
 | Hand-rolled pattern | Failure mode |
 |---|---|
@@ -27,7 +26,7 @@ Worse, the hand-rolled loops are reliably buggy in the same few ways:
 | `gh run watch --interval 120` | parks the entire agent for the CI duration |
 | "haiku subagent, keep an eye on CI" | the watcher forgets, the wake never fires, you re-ask tomorrow |
 
-`pr-watchd` makes those impossible: polling happens in a 60-line shell script
+`pr-watchd` makes those unnecessary: polling happens in a small shell script
 on a timer, costs zero tokens, and only *state changes* wake anyone.
 
 ## Install
@@ -40,7 +39,11 @@ cd pr-watch
 ```
 
 Requirements: [`gh`](https://cli.github.com) (authenticated), `jq`, bash.
-Cron users: add `*/5 * * * * ~/.local/bin/pr-watchd tick >/dev/null 2>&1`.
+Cron users: the installer prints a crontab line with the right `PATH` baked
+in (cron, like launchd, starts with a minimal `PATH` that usually lacks `gh`).
+
+Settings live in `~/.config/pr-watch/config.env` (written by the installer,
+sourced as shell; environment variables override it).
 
 ## Use
 
@@ -52,6 +55,7 @@ gh pr merge 123 --auto --squash
 pr-watchd add owner/repo 123 --auto       # auto-merge + watch
 pr-watchd add owner/repo 123              # watch + notify only
 pr-watchd add owner/repo 123 --agent      # also hand failures to a headless agent
+                                          # (run inside the checkout, or pass --dir <path>)
 
 pr-watchd list                            # what's being watched
 pr-watchd digest owner/repo               # zero-token status table
@@ -68,13 +72,19 @@ reported:
 - **newly-failed checks** — reported the moment they fail (an advisory check
   that never finishes cannot hold news back)
 - **merge conflict** — reported once per head
-- **green & ready** — reported once per head
-- **new human comments** — its own replies and `[bot]` accounts never wake it
+- **green & ready** — reported once per head, when GitHub says the PR can
+  merge now (`CLEAN`/`HAS_HOOKS`). A PR that is `BLOCKED` on a required review
+  is not "green".
+- **new human comments or submitted reviews** — its own replies and bot
+  accounts never wake it
 
-Optional `--agent` mode pipes a minimal brief (repo, PR, failing check names,
-hard rules) into a headless agent — `claude -p`, `codex exec`, `pi --print`,
-or `opencode run` — as a *fresh* session. Your interactive context is never
-re-sent.
+Everything comes from one GraphQL call per watch per tick.
+
+Optional `--agent` mode hands a minimal brief (repo, PR, failing check names,
+hard rules) to `AGENT_CMD` — `claude -p`, `codex exec`, `pi -p`, or
+`opencode run` — as a *fresh* session, in the background, inside the watch's
+checkout. Your interactive context is never re-sent. `AGENT_CMD` is a shell
+command line; the brief arrives on stdin and in `$PRWATCH_BRIEF`.
 
 ## Guards (learned the hard way)
 
@@ -86,6 +96,8 @@ re-sent.
 | head-move reset | on | stale failure memory after a force-push |
 | own-reply suppression | on | the agent waking itself |
 | bot suppression | on | CI bots and renovators as noise |
+| tick lock | on | overlapping cron/launchd runs double-notifying |
+| one agent per watch | on | a slow agent run piling up behind new wakes |
 
 All are environment-tunable; see the top of `bin/pr-watchd`.
 
@@ -112,7 +124,9 @@ which comments are your own.
 ## Development
 
 ```sh
-bash tests/smoke.sh     # 17 behavior tests, stubbed gh, real diffing logic
+bash tests/smoke.sh     # offline behavior tests: strict stubbed gh, real diffing logic
+bash tests/live.sh      # read-only check of the real query against GitHub (uses your gh auth)
+pr-watchd fetch owner/repo 123   # debug: the raw state row the daemon diffs
 ```
 
 MIT — see [LICENSE](LICENSE).
