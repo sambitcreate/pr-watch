@@ -1,30 +1,54 @@
 #!/usr/bin/env bash
-# fake gh — smoke-test stub. Drives pr-watchd from canned fixtures in $FAKE_DIR
-# while running the REAL jq diffing logic extracted from the daemon script.
+# fake gh — smoke-test stub. Serves canned GraphQL responses from $FAKE_DIR and
+# is deliberately STRICT about the command line: anything the real gh would
+# reject (unknown flags, missing args) fails here too, so the tests cannot
+# pass against an invocation that breaks in production.
 set -u
 FAKE_DIR="${FAKE_DIR:?set FAKE_DIR}"
-PRWATCHD_SRC="${PRWATCHD_SRC:?set PRWATCHD_SRC}"
 echo "$*" >> "$FAKE_DIR/calls.log"
+die() { echo "fake gh: $*" >&2; exit 1; }
 
-# Extract the daemon's canonical jq program once per invocation (cheap, correct).
-PRJQ="$(sed -n "/^PR_JQ='/,/^'$/p" "$PRWATCHD_SRC" | sed '1d;$d')"
-
-case "$1" in
+case "${1:-}" in
   api)
-    echo "${FAKE_ACCOUNT:-me}" ;;
+    [ "${2:-}" = "graphql" ] || die "only 'api graphql' is stubbed: $*"
+    shift 2
+    query="" owner="" name="" number=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) case "$2" in query=*) query="${2#query=}" ;; *) die "unexpected -f $2" ;; esac; shift 2 ;;
+        -F) case "$2" in
+              owner=*) owner="${2#owner=}" ;; name=*) name="${2#name=}" ;; number=*) number="${2#number=}" ;;
+              *) die "unexpected -F $2" ;;
+            esac; shift 2 ;;
+        *) die "unknown flag: $1" ;;
+      esac
+    done
+    [ -n "$query" ] && [ -n "$owner" ] && [ -n "$name" ] && [ -n "$number" ] || die "missing graphql variable"
+    case "$number" in *[!0-9]*) die "number must be an Int: $number" ;; esac
+    # the fixture may only use fields the query actually selects
+    for field in viewer headRefOid mergeable mergeStateStatus statusCheckRollup createdAt submittedAt __typename login; do
+      printf '%s' "$query" | grep -q "$field" || die "query does not select $field"
+    done
+    echo "graphql owner=$owner name=$name number=$number" >> "$FAKE_DIR/graphql.log"
+    [ -f "$FAKE_DIR/pr.json" ] || die "HTTP 502"   # simulates an unreadable PR
+    cat "$FAKE_DIR/pr.json" ;;
   pr)
-    case "$2" in
-      view)
-        if printf '%s\n' "$*" | grep -q 'headRefOid'; then
-          jq -r --arg lastcid "$(cat "$FAKE_DIR/lastcid.txt" 2>/dev/null || echo 0)" \
-                --arg me "${FAKE_ACCOUNT:-me}" "$PRJQ" "$FAKE_DIR/pr.json"
-        else
-          jq -r '([(.comments // [])[].databaseId] | max // 0) | tostring' "$FAKE_DIR/pr.json"
-        fi ;;
-      merge) echo "auto-merge enabled (fake)" ;;
-      list)  cat "$FAKE_DIR/list.tsv" 2>/dev/null ;;
-      *) echo "fake gh: unknown pr subcommand: $2" >&2; exit 1 ;;
+    case "${2:-}" in
+      merge)
+        [ "${4:-}" = "--repo" ] && [ "${6:-}" = "--auto" ] || die "bad merge args: $*"
+        echo "auto-merge enabled (fake)" ;;
+      list)
+        shift 2; jqexpr=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --state|--limit|--json|--repo) shift 2 ;;
+            --jq|-q) jqexpr="$2"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+          esac
+        done
+        jq -r "${jqexpr:-.}" "$FAKE_DIR/list.json" ;;
+      *) die "unknown pr subcommand: ${2:-}" ;;
     esac ;;
   *)
-    echo "fake gh: unhandled: $*" >&2; exit 1 ;;
+    die "unhandled: $*" ;;
 esac
