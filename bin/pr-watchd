@@ -6,110 +6,175 @@
 # actually changes. Polls and waits happen OUTSIDE any LLM context.
 #
 # Subcommands:
-#   pr-watchd add <owner/repo> <pr#> [--auto [--squash|--merge|--rebase]] [--agent]
+#   pr-watchd add <owner/repo> <pr#> [--auto [--squash|--merge|--rebase]] [--agent [--dir <checkout>]]
 #   pr-watchd remove <owner/repo> <pr#>
 #   pr-watchd list
 #   pr-watchd tick              # one poll pass; call from launchd/cron every few minutes
 #   pr-watchd digest [owner/repo]  # zero-token "what's mergeable" table
+#   pr-watchd fetch <owner/repo> <pr#>  # debug: print the raw state row for a PR
 #
 # Design guards (see README):
 #   WAKE_LIMIT          max unproductive wakes before a watch is parked (default 10)
 #   READ_FAILURE_LIMIT  consecutive read errors before a watch is dropped (default 15)
 #   own-reply suppression, bot suppression, head-move reset — baked in.
+#
+# Settings come from the environment or from $PRWATCH_CONFIG
+# (default ~/.config/pr-watch/config.env, sourced as shell; environment wins).
 
 set -u
 
+PRWATCH_CONFIG="${PRWATCH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/pr-watch/config.env}"
+if [ -f "$PRWATCH_CONFIG" ]; then
+  # environment variables already set take precedence over the config file
+  _prw_env="$(declare -px 2>/dev/null)"
+  # shellcheck disable=SC1090
+  . "$PRWATCH_CONFIG"
+  eval "$_prw_env" 2>/dev/null
+  unset _prw_env
+fi
+
 PRWATCH_HOME="${PRWATCH_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pr-watch}"
-PRWATCH_BIN="${PRWATCH_BIN:-$HOME/.local/bin}"
 POLL_INTERVAL="${POLL_INTERVAL:-300}"
 WAKE_LIMIT="${WAKE_LIMIT:-10}"
 READ_FAILURE_LIMIT="${READ_FAILURE_LIMIT:-15}"
 NOTIFY_CMD="${NOTIFY_CMD:-}"
 AGENT_CMD="${AGENT_CMD:-}"
 GH="${GH:-gh}"
+JQ="${JQ:-jq}"
 
 mkdir -p "$PRWATCH_HOME" 2>/dev/null
-
-account() { "$GH" api user --jq .login 2>/dev/null || echo "unknown-account"; }
 
 notify() { # notify <title> <message>
   local title="$1" msg="$2"
   if [ -n "$NOTIFY_CMD" ]; then
     "$NOTIFY_CMD" "$title" "$msg" 2>/dev/null || true
   elif command -v osascript >/dev/null 2>&1; then
-    osascript -e "display notification \"$msg\" with title \"pr-watchd\" subtitle \"$title\"" >/dev/null 2>&1 || true
+    # pass text as argv, never interpolated into AppleScript source
+    osascript -e 'on run argv' \
+              -e 'display notification (item 2 of argv) with title "pr-watchd" subtitle (item 1 of argv)' \
+               -e 'end run' "$title" "$msg" >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "pr-watchd: $title" "$msg" 2>/dev/null || true
+    notify-send -- "pr-watchd: $title" "$msg" 2>/dev/null || true
   else
     printf '[pr-watchd] %s: %s\n' "$title" "$msg"
   fi
 }
 
-state_file() { # state_file <owner/repo> <pr#>
-  printf '%s/%s__%s.state' "$PRWATCH_HOME" "$(printf '%s' "$1" | tr '/' '__')" "$2"
+# owner/repo#pr -> owner__repo__pr (GitHub owners cannot contain "_", so the
+# first "__" is unambiguous). REPO and PR are also stored inside the file.
+watch_key() { printf '%s__%s' "$(printf '%s' "$1" | sed 's|/|__|')" "$2"; }
+state_file() { printf '%s/%s.state' "$PRWATCH_HOME" "$(watch_key "$1" "$2")"; }
+agent_log()  { printf '%s/agent-%s.log' "$PRWATCH_HOME" "$(watch_key "$1" "$2")"; }
+
+valid_target() { # valid_target <owner/repo> <pr#>
+  case "$1" in */*/*|/*|*/|"") return 1 ;; */*) ;; *) return 1 ;; esac
+  case "$2" in ''|*[!0-9]*) return 1 ;; esac
 }
 
-agent_log() { printf '%s/agent-%s__%s.log' "$PRWATCH_HOME" "$(printf '%s' "$1" | tr '/' '__')" "$2"; }
+# ---- read current PR facts in ONE GraphQL call ------------------------------
+# Bots are identified by author.__typename (gh's --json output drops the
+# "[bot]" suffix, so login matching does not work).
+PR_QUERY='query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      mergeable
+      mergeStateStatus
+      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+        __typename
+        ... on CheckRun { name conclusion }
+        ... on StatusContext { context state }
+      } } } } } }
+      comments(last: 100) { nodes { createdAt author { __typename login } } }
+      reviews(last: 100) { nodes { submittedAt author { __typename login } } }
+    }
+  }
+}'
 
-# ---- read current PR facts in one gh call (TSV: sha, mergeable, mergeState,
-# ---- failed-checks csv, new-human-comment count) ------------------------------
+# Output TSV: sha, mergeable, mergeState, failed-checks csv, new-human count, cursor
+# The cursor is the newest comment/review timestamp seen in THIS response, so
+# nothing posted between two calls can be skipped.
 PR_JQ='
-  def human_new:
-    [ (.comments // [])[]
-      | select(((.databaseId // 0) > (if $lastcid == "" then 0 else ($lastcid | tonumber) end)))
-      | select((.author.login | test("\\[bot\\]$") | not) and (.author.login != $me)) ];
-  (human_new | length) as $nh |
-  ([ (.statusCheckRollup // [])[]
+  .data.viewer.login as $me |
+  .data.repository.pullRequest as $p |
+  if $p == null then error("pull request not found") else . end |
+  ([ ($p.comments.nodes // [])[] | {ts: .createdAt, a: .author} ] +
+   [ ($p.reviews.nodes  // [])[] | select(.submittedAt != null) | {ts: .submittedAt, a: .author} ]) as $items |
+  ([ $items[]
+     | select(.ts > $since)
+     | select(.a != null and .a.__typename != "Bot" and .a.login != $me
+              and (.a.login | test("\\[bot\\]$") | not)) ] | length) as $nh |
+  ([ $items[].ts ] | max // $since) as $cursor |
+  ([ ($p.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])[]
      | select(
-         ((.__typename // "") == "CheckRun" and
-           ((.conclusion // "") == "FAILURE" or (.conclusion // "") == "CANCELLED" or (.conclusion // "") == "ACTION_REQUIRED"))
+         (.__typename == "CheckRun" and
+           ((.conclusion // "") | IN("FAILURE","CANCELLED","ACTION_REQUIRED","TIMED_OUT","STARTUP_FAILURE")))
          or
-         ((.__typename // "") == "StatusContext" and
-           ((.state // "") == "FAILURE" or (.state // "") == "ERROR"))
+         (.__typename == "StatusContext" and ((.state // "") | IN("FAILURE","ERROR")))
        )
-     | (if ((.__typename // "") == "CheckRun") then (.name // "?") else (.context // "?") end) ]
+     | (if .__typename == "CheckRun" then (.name // "?") else (.context // "?") end)
+     | gsub("[,\t\n]"; " ") ]
     | unique | join(",")) as $failed |
-  "\(.headRefOid // "")\t\(.mergeable // "")\t\(.mergeStateStatus // "")\t\($failed)\t\($nh)"
+  "\($p.headRefOid // "")\t\($p.mergeable // "")\t\($p.mergeStateStatus // "")\t\($failed)\t\($nh)\t\($cursor)"
 '
 
-fetch_pr() { # fetch_pr <repo> <pr> <lastcid> <me>  -> "sha<TAB>mergeable<TAB>state<TAB>failed<TAB>newhumans"
-  "$GH" pr view "$2" --repo "$1" --json \
-    headRefOid,mergeable,mergeStateStatus,statusCheckRollup,comments \
-    --arg lastcid "$3" --arg me "$4" --jq "$PR_JQ"
+fetch_pr() { # fetch_pr <owner/repo> <pr#> <since-timestamp>  -> TSV row
+  local json
+  json="$("$GH" api graphql -f query="$PR_QUERY" \
+            -F owner="${1%%/*}" -F name="${1#*/}" -F number="$2" 2>/dev/null)" || return 1
+  printf '%s' "$json" | "$JQ" -er --arg since "$3" "$PR_JQ" 2>/dev/null
 }
 
 # ---- per-watch state (flat KEY=VALUE file) ----------------------------------
 st_get() { # st_get <file> <key>
-  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
+  awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$1" 2>/dev/null
 }
-st_set() { # st_set <file> <key> <value>  (literal value; no regex in replacement)
+st_set() { # st_set <file> <key> <value>  (literal value)
   local f="$1" k="$2" v="$3" tmp="${f}.tmp.$$"
-  touch "$f" 2>/dev/null || return 1
-  grep -v "^$k=" "$f" > "$tmp" 2>/dev/null || true
+  [ -f "$f" ] || return 1
+  awk -v k="$2" 'index($0, k "=") != 1' "$f" > "$tmp" 2>/dev/null || true
   printf '%s=%s\n' "$k" "$v" >> "$tmp"
   mv "$tmp" "$f"
 }
 
-# ---- agent handoff (headless, minimal brief) ---------------------------------
-run_agent() { # run_agent <repo> <pr> <brief>
-  [ -n "$AGENT_CMD" ] || return 0
-  local repo="$1" pr="$2" brief="$3"
-  {
+# ---- agent handoff (headless, minimal brief, never blocks the tick) ----------
+run_agent() { # run_agent <state-file> <repo> <pr> <brief>
+  local f="$1" repo="$2" pr="$3" brief="$4"
+  [ -n "$AGENT_CMD" ] && [ "$(st_get "$f" AGENT)" = "1" ] || return 0
+  local dir log lock pid
+  dir="$(st_get "$f" DIR)"; dir="${dir:-$HOME}"
+  log="$(agent_log "$repo" "$pr")"
+  lock="$PRWATCH_HOME/$(watch_key "$repo" "$pr").agent.pid"
+  pid="$(cat "$lock" 2>/dev/null)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    printf '[%s] agent still running (pid %s); skipping wake\n' "$(date)" "$pid" >> "$log"
+    return 0
+  fi
+  PRWATCH_BRIEF="$(
     printf 'PR watch wake — %s#%s\n\n%s\n' "$repo" "$pr" "$brief"
     printf 'Rules: fix forward. Cap: 10 tool rounds. One retry max for flaky CI. '
-    printf 'Push to the PR head branch when done. Do not wait or poll; report and exit.\n'
-  } | ${AGENT_CMD} >> "$(agent_log "$repo" "$pr")" 2>&1 || true
+    printf 'If your permissions allow, push the fix to the PR head branch; otherwise report the diagnosis and proposed fix. '
+    printf 'Do not wait or poll; report and exit.\n'
+  )"
+  export PRWATCH_BRIEF PRWATCH_REPO="$repo" PRWATCH_PR="$pr"
+  # AGENT_CMD is a shell command line: quoting is honored, and the brief is
+  # on stdin and in $PRWATCH_BRIEF for agents that take it as an argument.
+  ( cd "$dir" 2>/dev/null || cd "$HOME"
+    printf '%s\n' "$PRWATCH_BRIEF" | nohup bash -c "$AGENT_CMD" >> "$log" 2>&1
+    rm -f "$lock"
+  ) </dev/null >/dev/null 2>&1 &
+  echo "$!" > "$lock"
 }
 
 # ---- one poll pass ------------------------------------------------------------
-process_watch() { # process_watch <owner/repo> <pr#>
-  local repo="$1" pr="$2" f me row
-  f="$(state_file "$repo" "$pr")"
-  [ -f "$f" ] || { echo "no state for $repo#$pr"; return 1; }
+process_watch() { # process_watch <state-file>
+  local f="$1" repo pr row
+  repo="$(st_get "$f" REPO)"; pr="$(st_get "$f" PR)"
+  valid_target "$repo" "$pr" || { echo "corrupt watch file: $f" >&2; return 1; }
 
-  me="$(account)"
-  row="$(fetch_pr "$repo" "$pr" "$(st_get "$f" LAST_CID)" "$me")" || {
-    local fails; fails=$(( $(st_get "$f" READ_FAILS || echo 0) + 1 ))
+  row="$(fetch_pr "$repo" "$pr" "$(st_get "$f" LAST_SEEN)")" || {
+    local fails; fails=$(( $(st_get "$f" READ_FAILS) + 1 ))
     st_set "$f" READ_FAILS "$fails"
     if [ "$fails" -ge "$READ_FAILURE_LIMIT" ]; then
       notify "watch dropped" "$repo#$pr unreadable $fails times in a row"
@@ -119,12 +184,14 @@ process_watch() { # process_watch <owner/repo> <pr#>
   }
   st_set "$f" READ_FAILS 0
 
-  local sha mergeable mstate failed nhumans
+  local sha mergeable mstate failed nhumans cursor
+  # cut, not `read`: read collapses empty tab-separated fields
   sha="$(printf '%s' "$row" | cut -f1)"
   mergeable="$(printf '%s' "$row" | cut -f2)"
   mstate="$(printf '%s' "$row" | cut -f3)"
   failed="$(printf '%s' "$row" | cut -f4)"
   nhumans="$(printf '%s' "$row" | cut -f5)"
+  cursor="$(printf '%s' "$row" | cut -f6)"
 
   # head moved (new push): reset wake counter and remembered failures
   local prev_sha; prev_sha="$(st_get "$f" HEAD_SHA)"
@@ -135,12 +202,12 @@ process_watch() { # process_watch <owner/repo> <pr#>
     st_set "$f" REPORTED_GREEN 0
   fi
 
-  local wakes; wakes=$(( $(st_get "$f" WAKES || echo 0) ))
+  local wakes; wakes=$(( $(st_get "$f" WAKES) + 0 ))
   local reported=""
 
   # 1. newly-failed checks are reported the moment they appear
   if [ -n "$failed" ]; then
-    local known new
+    local known new n names
     known="$(st_get "$f" FAILED)"
     new=""
     IFS=',' read -r -a names <<< "$failed"
@@ -150,7 +217,7 @@ process_watch() { # process_watch <owner/repo> <pr#>
     if [ -n "$new" ]; then
       reported="checks failing: $new"
       st_set "$f" FAILED "$failed"
-      run_agent "$repo" "$pr" "Checks failing on $repo#$pr: $new. Fetch logs with: gh run list/gh pr checks. Fix and push."
+      run_agent "$f" "$repo" "$pr" "Checks failing on $repo#$pr: $new. Fetch logs with: gh pr checks $pr --repo $repo; gh run view <run-id> --repo $repo --log-failed. Fix and push."
     fi
   elif [ -n "$(st_get "$f" FAILED)" ]; then
     st_set "$f" FAILED ""
@@ -162,21 +229,20 @@ process_watch() { # process_watch <owner/repo> <pr#>
     st_set "$f" REPORTED_CONFLICT 1
   fi
 
-  # 3. green / ready
-  if [ "$mstate" = "CLEAN" ] && [ "$mergeable" = "MERGEABLE" ] && [ "$(st_get "$f" REPORTED_GREEN)" != "1" ]; then
+  # 3. green / ready. "Ready" means GitHub says it can merge now (CLEAN or
+  # HAS_HOOKS). BLOCKED — e.g. waiting on a required review — is not green.
+  if { [ "$mstate" = "CLEAN" ] || [ "$mstate" = "HAS_HOOKS" ]; } && [ "$mergeable" = "MERGEABLE" ] \
+     && [ "$(st_get "$f" REPORTED_GREEN)" != "1" ]; then
     reported="${reported:+$reported; }all checks green — ready to merge"
     st_set "$f" REPORTED_GREEN 1
   fi
 
-  # 4. new human comments (bots and own replies never wake it)
+  # 4. new human comments/reviews (bots and own replies never wake it)
   if [ "${nhumans:-0}" -gt 0 ] 2>/dev/null; then
     reported="${reported:+$reported; }$nhumans new human comment(s)"
   fi
 
-  # remember last comment id for the next pass
-  local lastcid
-  lastcid="$("$GH" pr view "$pr" --repo "$repo" --json comments --jq '([(.comments // [])[].databaseId] | max // 0) | tostring')" 2>/dev/null || lastcid=""
-  [ -n "$lastcid" ] && st_set "$f" LAST_CID "$lastcid"
+  [ -n "$cursor" ] && st_set "$f" LAST_SEEN "$cursor"
   st_set "$f" HEAD_SHA "$sha"
 
   if [ -n "$reported" ]; then
@@ -189,76 +255,101 @@ process_watch() { # process_watch <owner/repo> <pr#>
     fi
   fi
   [ "${PRWATCH_DEBUG:-0}" = "1" ] && echo "$repo#$pr sha=${sha:0:8} mstate=$mstate wakes=$wakes reported=[$reported]"
+  return 0
 }
 
 cmd_tick() {
+  # one tick at a time: overlapping cron/launchd runs would double-notify
+  TICK_LOCK="$PRWATCH_HOME/.tick.lock"   # global: the EXIT trap runs after this function returns
+  if ! mkdir "$TICK_LOCK" 2>/dev/null; then
+    local holder; holder="$(cat "$TICK_LOCK/pid" 2>/dev/null)"
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      echo "tick already running (pid $holder)" >&2; return 0
+    fi
+    rm -rf "$TICK_LOCK"; mkdir "$TICK_LOCK" 2>/dev/null || return 0
+  fi
+  echo "$$" > "$TICK_LOCK/pid"
+  trap 'rm -rf "$TICK_LOCK"' EXIT
+
   local sf found=0
   for sf in "$PRWATCH_HOME"/*.state; do
-    [ -f "$sf" ] || return 0
+    [ -f "$sf" ] || continue
     found=1
-    local name repo pr
-    name="$(basename "$sf" .state)"
-    repo="$(printf '%s' "$name" | sed -e 's/^\(.*\)__[0-9]*$/\1/' -e 's/__/\//')"
-    pr="${name##*__}"
-    process_watch "$repo" "$pr"
+    process_watch "$sf"
   done
   [ "$found" = "1" ] || echo "no watches registered"
 }
 
-cmd_add() { # cmd_add <owner/repo> <pr#> [--auto [--squash|--merge|--rebase]] [--agent]
+cmd_add() { # cmd_add <owner/repo> <pr#> [flags]
   local repo="$1" pr="$2"; shift 2
-  local do_auto=0 method="--squash" want_agent=0
+  valid_target "$repo" "$pr" || { echo "usage: pr-watchd add <owner/repo> <pr#>" >&2; return 2; }
+  local do_auto=0 method="--squash" want_agent=0 dir=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --auto) do_auto=1 ;;
       --squash|--merge|--rebase) method="$1" ;;
       --agent) want_agent=1 ;;
+      --dir) [ $# -ge 2 ] || { echo "--dir needs a path" >&2; return 2; }; dir="$2"; shift ;;
       *) echo "unknown flag: $1" >&2; return 2 ;;
     esac
     shift
   done
+  if [ "$want_agent" = "1" ]; then
+    # the woken agent works in a checkout: --dir, else the current git repo
+    if [ -z "$dir" ] && git rev-parse --show-toplevel >/dev/null 2>&1; then dir="$(git rev-parse --show-toplevel)"; fi
+    [ -n "$dir" ] && dir="$(cd "$dir" 2>/dev/null && pwd)" || { echo "--agent needs a checkout: run inside the repo or pass --dir" >&2; return 2; }
+    [ -n "$AGENT_CMD" ] || echo "  ! AGENT_CMD is not set (env or $PRWATCH_CONFIG); wakes will only notify" >&2
+  fi
+
+  local row; row="$(fetch_pr "$repo" "$pr" "")" || { echo "cannot read $repo#$pr (check gh auth and the PR number)" >&2; return 1; }
   local f; f="$(state_file "$repo" "$pr")"
   : > "$f"
+  st_set "$f" REPO "$repo"
+  st_set "$f" PR "$pr"
   st_set "$f" READ_FAILS 0
   st_set "$f" WAKES 0
   st_set "$f" REPORTED_CONFLICT 0
   st_set "$f" REPORTED_GREEN 0
   st_set "$f" AGENT "$want_agent"
-  local me; me="$(account)"
-  local row; row="$(fetch_pr "$repo" "$pr" "" "$me")" || { echo "cannot read $repo#$pr" >&2; rm -f "$f"; return 1; }
-  st_set "$f" HEAD_SHA "$(printf '%s' "$row" | cut -f1)"
+  st_set "$f" DIR "$dir"
   # seed baseline: only CHANGES from here on wake anyone
+  st_set "$f" HEAD_SHA "$(printf '%s' "$row" | cut -f1)"
   st_set "$f" FAILED "$(printf '%s' "$row" | cut -f4)"
+  st_set "$f" LAST_SEEN "$(printf '%s' "$row" | cut -f6)"
   local m0; m0="$(printf '%s' "$row" | cut -f3)"
-  if [ "$m0" = "CLEAN" ] && [ "$(printf '%s' "$row" | cut -f2)" = "MERGEABLE" ]; then st_set "$f" REPORTED_GREEN 1; fi
+  if { [ "$m0" = "CLEAN" ] || [ "$m0" = "HAS_HOOKS" ]; } && [ "$(printf '%s' "$row" | cut -f2)" = "MERGEABLE" ]; then st_set "$f" REPORTED_GREEN 1; fi
   if [ "$m0" = "DIRTY" ]; then st_set "$f" REPORTED_CONFLICT 1; fi
-  local lastcid
-  lastcid="$("$GH" pr view "$pr" --repo "$repo" --json comments --jq '([(.comments // [])[].databaseId] | max // 0) | tostring')" 2>/dev/null || lastcid="0"
-  st_set "$f" LAST_CID "$lastcid"
 
-  if [ "$do_auto" = "1" ]; then
-    echo "  → setting auto-merge: $GH pr merge $pr --repo $repo --auto $method"
-    "$GH" pr merge "$pr" --repo "$repo" --auto "$method" && echo "  → GitHub will merge when green. Watcher will only ping on conflict/failure." || return 1
-  fi
   echo "watching $repo#$pr  (wake limit $WAKE_LIMIT, poll ~${POLL_INTERVAL}s)"
   echo "  state: $f"
+  [ "$want_agent" = "1" ] && echo "  agent: wakes run AGENT_CMD in $dir"
+  if [ "$do_auto" = "1" ]; then
+    echo "  → setting auto-merge: $GH pr merge $pr --repo $repo --auto $method"
+    if "$GH" pr merge "$pr" --repo "$repo" --auto "$method"; then
+      echo "  → GitHub will merge when green. Watcher will only ping on conflict/failure."
+    else
+      echo "  ! auto-merge failed (is it enabled for the repo?); the watch is still active" >&2
+      return 1
+    fi
+  fi
 }
 
 cmd_remove() {
   local f; f="$(state_file "$1" "$2")"
-  rm -f "$f" && echo "removed $1#$2"
+  if [ -f "$f" ]; then rm -f "$f" && echo "removed $1#$2"; else echo "not watching $1#$2" >&2; return 1; fi
 }
 
 cmd_list() {
-  local sf name repo pr wakes mstate
-  printf '%-40s %-8s %-7s %s\n' "WATCH" "PR" "WAKES" "HEAD"
+  local sf any=0
+  printf '%-40s %-8s %-7s %-6s %s\n' "WATCH" "PR" "WAKES" "AGENT" "HEAD"
   for sf in "$PRWATCH_HOME"/*.state; do
-    [ -f "$sf" ] || { echo "  (none)"; return 0; }
-    name="$(basename "$sf" .state)"
-    repo="$(printf '%s' "$name" | sed -e 's/^\(.*\)__[0-9]*$/\1/' -e 's/__/\/')"
-    pr="${name##*__}"
-    printf '%-40s %-8s %-7s %s\n' "$repo" "$pr" "$(st_get "$sf" WAKES)" "$(st_get "$sf" HEAD_SHA | cut -c1-8)"
+    [ -f "$sf" ] || continue
+    any=1
+    printf '%-40s %-8s %-7s %-6s %s\n' "$(st_get "$sf" REPO)" "$(st_get "$sf" PR)" \
+      "$(st_get "$sf" WAKES)" "$( [ "$(st_get "$sf" AGENT)" = "1" ] && echo yes || echo no )" \
+      "$(st_get "$sf" HEAD_SHA | cut -c1-8)"
   done
+  [ "$any" = "1" ] || echo "  (none)"
 }
 
 cmd_digest() { # zero-token status table; optional <owner/repo>, defaults to current repo
@@ -272,8 +363,14 @@ cmd_digest() { # zero-token status table; optional <owner/repo>, defaults to cur
               {printf "%-6s %-10s %-9s %s\n",$1,$2,$3,substr($4,1,60)}'
 }
 
+cmd_fetch() {
+  valid_target "$1" "$2" || { echo "usage: pr-watchd fetch <owner/repo> <pr#>" >&2; return 2; }
+  fetch_pr "$1" "$2" "" || { echo "cannot read $1#$2" >&2; return 1; }
+  echo
+}
+
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -285,6 +382,7 @@ case "$cmd" in
   list)   cmd_list ;;
   tick)   cmd_tick ;;
   digest) cmd_digest "$@" ;;
+  fetch)  [ $# -ge 2 ] || usage 2; cmd_fetch "$@" ;;
   -h|--help|help) usage 0 ;;
   *) echo "unknown command: $cmd" >&2; usage 2 ;;
 esac
