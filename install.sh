@@ -41,7 +41,7 @@ if [ "${1:-}" = "--launchd" ] && [ "$(uname)" = "Darwin" ]; then
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load "$plist"
   say "launchd timer installed: $plist (every 5 minutes)"
-  say "logs: \$PRWATCH_HOME=/\${XDG_STATE_HOME:-\$HOME/.local/state}/pr-watch"
+  say "state dir: ${XDG_STATE_HOME:-$HOME/.local/state}/pr-watch"
 else
   say "add a cron line to run one poll pass every 5 minutes:"
   printf '  */5 * * * * %s/bin/pr-watchd tick >/dev/null 2>&1\n' "$PREFIX"
