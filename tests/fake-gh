@@ -26,7 +26,7 @@ case "${1:-}" in
     [ -n "$query" ] && [ -n "$owner" ] && [ -n "$name" ] && [ -n "$number" ] || die "missing graphql variable"
     case "$number" in *[!0-9]*) die "number must be an Int: $number" ;; esac
     # the fixture may only use fields the query actually selects
-    for field in viewer headRefOid mergeable mergeStateStatus statusCheckRollup createdAt submittedAt __typename login; do
+    for field in viewer state authorAssociation headRefOid mergeable mergeStateStatus statusCheckRollup createdAt submittedAt __typename login; do
       printf '%s' "$query" | grep -q "$field" || die "query does not select $field"
     done
     echo "graphql owner=$owner name=$name number=$number" >> "$FAKE_DIR/graphql.log"
