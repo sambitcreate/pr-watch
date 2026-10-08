@@ -45,14 +45,14 @@ export NOTIFY_CMD="$FAKE_DIR/notify"
 export WAKE_LIMIT=10 READ_FAILURE_LIMIT=3
 : > "$NOTIFY_LOG"
 
-# fixture writer: write_pr <sha> <mstate> <mergeable> <failedname|''> <comments-json> [reviews-json] [conclusion]
+# fixture writer: write_pr <sha> <mstate> <mergeable> <failedname|''> <comments-json> [reviews-json] [conclusion] [pr-state]
 # Emits the GraphQL response shape the daemon's query returns.
 write_pr() {
-  local sha="$1" mstate="$2" mergeable="$3" failed="$4" comments="$5" reviews="${6:-[]}" concl="${7:-FAILURE}"
+  local sha="$1" mstate="$2" mergeable="$3" failed="$4" comments="$5" reviews="${6:-[]}" concl="${7:-FAILURE}" pstate="${8:-OPEN}"
   local checks='{"__typename":"CheckRun","name":"ci/test","conclusion":"SUCCESS"},{"__typename":"StatusContext","context":"ci/legacy","state":"SUCCESS"}'
   [ -n "$failed" ] && checks="$checks"',{"__typename":"CheckRun","name":"'"$failed"'","conclusion":"'"$concl"'"}'
-  printf '{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"headRefOid":"%s","mergeable":"%s","mergeStateStatus":"%s","commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[%s]}}}}]},"comments":{"nodes":%s},"reviews":{"nodes":%s}}}}}' \
-    "$sha" "$mergeable" "$mstate" "$checks" "$comments" "$reviews" > "$FAKE_DIR/pr.json"
+  printf '{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"state":"%s","headRefOid":"%s","mergeable":"%s","mergeStateStatus":"%s","commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[%s]}}}}]},"comments":{"nodes":%s},"reviews":{"nodes":%s}}}}}' \
+    "$pstate" "$sha" "$mergeable" "$mstate" "$checks" "$comments" "$reviews" > "$FAKE_DIR/pr.json"
   jq -e . "$FAKE_DIR/pr.json" > /dev/null 2>&1 || { echo "bad fixture json"; exit 1; }
 }
 c() { # c <timestamp-minute> <login> [User|Bot]
@@ -251,6 +251,41 @@ assert_contains "$WORK/install.out" "skill skipped for codex" "missing agent dir
 [ -x "$WORK/home/.local/bin/pr-watchd" ] && ok "daemon installed" || fail "daemon installed"
 [ -f "$WORK/home/.claude/skills/pr-watch/SKILL.md" ] && ok "skill installed for present agent" || fail "skill installed for present agent"
 [ -f "$WORK/home/.config/pr-watch/config.env" ] && ok "config template written" || fail "config template written"
+
+echo "# 20. a check that recovers and fails again on the same head re-wakes"
+rm -f "$PRWATCH_HOME"/*.state; : > "$NOTIFY_LOG"
+both='{"__typename":"CheckRun","name":"lint","conclusion":"FAILURE"},{"__typename":"CheckRun","name":"e2e","conclusion":"FAILURE"}'
+write_pr "iiii000" "CLEAN" "MERGEABLE" "" "[]"
+"$PRWATCHD" add example/repo 22 >/dev/null 2>&1
+write_pr "iiii000" "UNSTABLE" "MERGEABLE" "" "[]"
+sed -i.bak 's|"conclusion":"SUCCESS"}|&,'"$both"'|' "$FAKE_DIR/pr.json"   # lint + e2e failing
+"$PRWATCHD" tick >/dev/null 2>&1
+assert_count "$NOTIFY_LOG" 1 "two failures wake once"
+write_pr "iiii000" "UNSTABLE" "MERGEABLE" "e2e" "[]"                     # lint recovers
+"$PRWATCHD" tick >/dev/null 2>&1
+assert_count "$NOTIFY_LOG" 1 "a recovery alone is silent"
+write_pr "iiii000" "UNSTABLE" "MERGEABLE" "" "[]"
+sed -i.bak 's|"conclusion":"SUCCESS"}|&,'"$both"'|' "$FAKE_DIR/pr.json"   # lint fails again
+"$PRWATCHD" tick >/dev/null 2>&1
+assert_count "$NOTIFY_LOG" 2 "re-failed check wakes again"
+assert_contains "$NOTIFY_LOG" "checks failing: lint" "re-wake names the re-failed check"
+
+echo "# 21. merged and closed PRs notify once and drop the watch"
+rm -f "$PRWATCH_HOME"/*.state; : > "$NOTIFY_LOG"
+write_pr "jjjj000" "CLEAN" "MERGEABLE" "" "[]"
+"$PRWATCHD" add example/repo 23 >/dev/null 2>&1
+write_pr "jjjj000" "UNKNOWN" "UNKNOWN" "" "[]" "[]" "" "MERGED"
+"$PRWATCHD" tick >/dev/null 2>&1
+assert_contains "$NOTIFY_LOG" "merged" "merge is reported"
+if ls "$PRWATCH_HOME"/*.state >/dev/null 2>&1; then fail "merged watch removed"; else ok "merged watch removed"; fi
+write_pr "jjjj000" "CLEAN" "MERGEABLE" "" "[]"
+"$PRWATCHD" add example/repo 24 >/dev/null 2>&1
+write_pr "jjjj000" "UNKNOWN" "UNKNOWN" "" "[]" "[]" "" "CLOSED"
+"$PRWATCHD" tick >/dev/null 2>&1
+assert_contains "$NOTIFY_LOG" "closed without merging" "close is reported"
+if ls "$PRWATCH_HOME"/*.state >/dev/null 2>&1; then fail "closed watch removed"; else ok "closed watch removed"; fi
+assert_count "$NOTIFY_LOG" 2 "merge and close each notify once"
+"$PRWATCHD" add example/repo 25 >/dev/null 2>&1 && fail "add of a closed PR fails" || ok "add of a closed PR fails"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
