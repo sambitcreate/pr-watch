@@ -88,6 +88,15 @@ hard rules) to `AGENT_CMD` — `claude -p`, `codex exec`, `pi -p`, or
 checkout. Your interactive context is never re-sent. `AGENT_CMD` is a shell
 command line; the brief arrives on stdin and in `$PRWATCH_BRIEF`.
 
+**Untrusted PRs.** A PR's author controls its check names, its CI logs, and
+the code the agent would build on, so a stranger's PR can try to steer an
+agent that has push access. `add --agent` therefore refuses PRs whose author
+is not you or an owner, member, or collaborator of the repo; watch those
+without `--agent`, or pass `--allow-untrusted` if you accept the risk. The
+brief also strips control characters from check names, caps their length,
+and tells the agent that CI output is data, not instructions. Keep
+`AGENT_CMD`'s permissions as narrow as the adapters suggest.
+
 ## Guards (learned the hard way)
 
 | Guard | Default | Prevents |
@@ -100,6 +109,7 @@ command line; the brief arrives on stdin and in `$PRWATCH_BRIEF`.
 | bot suppression | on | CI bots and renovators as noise |
 | tick lock | on | overlapping cron/launchd runs double-notifying |
 | one agent per watch | on | a slow agent run piling up behind new wakes |
+| author trust for `--agent` | on | a stranger's PR steering an agent that can push |
 
 All are environment-tunable; see the top of `bin/pr-watchd`.
 
