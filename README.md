@@ -77,6 +77,8 @@ reported:
   is not "green".
 - **new human comments or submitted reviews** — its own replies and bot
   accounts never wake it
+- **merged or closed** — reported once, then the watch removes itself
+  (`add` refuses a PR that is already merged or closed)
 
 Everything comes from one GraphQL call per watch per tick.
 
