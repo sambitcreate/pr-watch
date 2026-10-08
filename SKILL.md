@@ -40,8 +40,9 @@ pr-watchd add <owner/repo> <pr-number> --agent    # also hand failures to a head
 `--dir <path>`.
 
 The daemon polls GitHub on a timer, outside any LLM. It wakes you (or the
-user) only on: newly-failed checks, merge conflicts, green-and-ready, or new
-*human* comments and reviews (its own replies and bot comments never wake it).
+user) only on: newly-failed checks, merge conflicts, green-and-ready, new
+*human* comments and reviews (its own replies and bot comments never wake it),
+or the PR being merged or closed (which also ends the watch).
 
 Verify with `pr-watchd list`. Then **end your turn**. The watcher continues
 without you; you will be invoked fresh, with a minimal brief, when there is
