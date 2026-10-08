@@ -17,12 +17,14 @@ sha="$(printf '%s' "$row" | cut -f1)"
 nh="$(printf '%s' "$row" | cut -f5)"
 cursor="$(printf '%s' "$row" | cut -f6)"
 pstate="$(printf '%s' "$row" | cut -f7)"
+trust="$(printf '%s' "$row" | cut -f8)"
 rc=0
-[ "$fields" = "7" ] && echo "  ok  - 7 fields" || { echo "  NOT OK - expected 7 fields, got $fields"; rc=1; }
+[ "$fields" = "8" ] && echo "  ok  - 8 fields" || { echo "  NOT OK - expected 8 fields, got $fields"; rc=1; }
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && echo "  ok  - head sha" || { echo "  NOT OK - head sha: $sha"; rc=1; }
 [[ "$nh" =~ ^[0-9]+$ ]] && echo "  ok  - human count" || { echo "  NOT OK - human count: $nh"; rc=1; }
 [[ -z "$cursor" || "$cursor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] && echo "  ok  - cursor" || { echo "  NOT OK - cursor: $cursor"; rc=1; }
 [[ "$pstate" =~ ^(OPEN|CLOSED|MERGED)$ ]] && echo "  ok  - pr state" || { echo "  NOT OK - pr state: $pstate"; rc=1; }
+[[ "$trust" =~ ^(trusted|untrusted)$ ]] && echo "  ok  - author trust" || { echo "  NOT OK - author trust: $trust"; rc=1; }
 "$PRWATCHD" add "$repo" "$pr" >/dev/null && "$PRWATCHD" tick >/dev/null && "$PRWATCHD" list | grep -qF "$repo" \
   && echo "  ok  - add/tick/list round-trip" || { echo "  NOT OK - add/tick/list round-trip"; rc=1; }
 exit "$rc"
