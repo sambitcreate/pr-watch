@@ -45,7 +45,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 # READ_FAILURE_LIMIT=15
 # NOTIFY_CMD=/path/to/notifier          # called as: NOTIFY_CMD <title> <message>
 # Headless agent for `pr-watchd add ... --agent` (see adapters/):
-# AGENT_CMD='claude -p --allowedTools "Bash(gh:*) Bash(git:*) Read Edit" --permission-mode acceptEdits'
+# AGENT_CMD='claude -p --allowedTools "Bash(gh pr checks:*) Bash(gh pr view:*) Bash(gh pr diff:*) Bash(gh run view:*) Bash(git:*) Read Edit" --permission-mode acceptEdits'
 EOF
   say "config template → $CONFIG_FILE"
 fi
